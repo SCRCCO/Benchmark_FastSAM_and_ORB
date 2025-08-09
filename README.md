@@ -4,6 +4,18 @@
 Script di benchmark per:
 - **FastSAM-x** e **FastSAM-s** a risoluzioni: `512, 576, 640, 704, 768, 832, 896, 960, 1024` su **8 immagini statiche**.
 - **ORB (OpenCV)** con sweep di combinazioni parametriche, misurando **latenza**, **#keypoint** e **keypoints/ms**.
+- **ORB per Pose estimation e Orientamento** stima orientamento e angolo di immagini ruotate di 45 gradi (front/back) + angolo usando due reference:
+
+	•	Coop_fronte_texture_fronte.png (**front**)
+
+ 	•	Coop_retro_texture_retro.png (**back**)
+<img width="512" height="512" alt="image" src="https://github.com/user-attachments/assets/2836cc11-2758-48c8-8f54-1132330a1dc9" />
+
+
+
+
+
+
 
 **Output:**  CSV con i tempi e risultati.
 
