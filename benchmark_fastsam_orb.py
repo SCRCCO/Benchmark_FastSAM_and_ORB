@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 Benchmark FastSAM (x & s) a varie risoluzioni + sweep ORB.
-Esegue senza argomenti e produce UN SOLO CSV: benchmark_results.csv
+Esegue senza argomenti e produce DUE CSV:
+- fastsam_benchmark.csv
+- orb_benchmark.csv
 
 - Immagini: ./images/*.jpg|png|bmp|tif (ne usa 8; se >8 prende le prime 8).
 - Immagini ORB: ./images_detection/* (se vuota, usa la prima di ./images)
@@ -31,10 +33,6 @@ except Exception:
 
 # OpenCV per ORB
 import cv2
-
-# Download utils
-import urllib.request
-from urllib.error import URLError, HTTPError
 
 try:
     from tqdm import tqdm
@@ -85,13 +83,12 @@ def save_csv(df: pd.DataFrame, path: str):
 def run_fastsam_bench(
     model_path, device, sizes, images, repeats=5, conf=0.4, iou=0.9, retina_masks=True
 ):
-    # Con ultralytics: FastSAMClass(path) funziona come previsto (user request)
     model = FastSAM(model_path)
     rows = []
     for size in sizes:
         for name, img in images:
             # warmup
-            _ = model(
+            result = model(
                 img,
                 device=device,
                 retina_masks=retina_masks,
@@ -102,7 +99,7 @@ def run_fastsam_bench(
             sync_device(device)
             for r in range(repeats):
                 t0 = time.perf_counter()
-                _ = model(
+                result = model(
                     img,
                     device=device,
                     retina_masks=retina_masks,
@@ -112,9 +109,13 @@ def run_fastsam_bench(
                 )
                 sync_device(device)
                 dt_ms = (time.perf_counter() - t0) * 1000.0
+                n_detections = (
+                    len(result[0].masks.data)
+                    if hasattr(result[0], "masks") and hasattr(result[0].masks, "data")
+                    else 0
+                )
                 rows.append(
                     {
-                        # comuni
                         "test_type": "fastsam",
                         "framework": "FastSAM",
                         "variant": Path(model_path).name,
@@ -122,24 +123,11 @@ def run_fastsam_bench(
                         "image": name,
                         "run": r + 1,
                         "latency_ms": round(dt_ms, 3),
-                        # fastsam-specific
                         "img_size": size,
                         "conf": conf,
                         "iou": iou,
                         "retina_masks": retina_masks,
-                        # orb-specific (NaN)
-                        "n_keypoints": np.nan,
-                        "desc_shape_0": np.nan,
-                        "desc_shape_1": np.nan,
-                        "kp_per_ms": np.nan,
-                        "nfeatures": np.nan,
-                        "scaleFactor": np.nan,
-                        "nlevels": np.nan,
-                        "edgeThreshold": np.nan,
-                        "WTA_K": np.nan,
-                        "scoreType": np.nan,
-                        "patchSize": np.nan,
-                        "fastThreshold": np.nan,
+                        "n_detections": n_detections,
                     }
                 )
     return pd.DataFrame(rows)
@@ -168,69 +156,109 @@ def run_orb_sweep(image, image_name, repeats=3, max_side=1024, max_combos=200):
     gray = _downscale_max(gray, max_side=max_side)
 
     grid = {
-        "nfeatures": [200, 500],
-        "scaleFactor": [1.1, 1.2],
-        "nlevels": [4, 8],
-        "edgeThreshold": [15, 31],
-        "WTA_K": [2],  # fisso (riduce combinazioni)
-        "scoreType": [cv2.ORB_HARRIS_SCORE],  # fisso (stabile)
-        "patchSize": [31],
-        "fastThreshold": [5, 10],
+        "nfeatures": [100, 500, 1000, 2500, 5000],
+        "scaleFactor": [1.1, 1.2, 1.3, 1.5],
+        "nlevels": [4, 6, 8, 12],
+        "edgeThreshold": [10, 20, 31, 50],
+        "firstLevel": [0],  # fisso
+        "WTA_K": [2, 3, 4],
+        "scoreType": [cv2.ORB_HARRIS_SCORE, cv2.ORB_FAST_SCORE],
+        "patchSize": [31, 21, 41],
+        "fastThreshold": [5, 10, 20, 30],
     }
+
     keys = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
     if len(combos) > max_combos:
-        combos = combos[:max_combos]
+        step = len(combos) // max_combos
+        combos = combos[::step][:max_combos]
 
     rows = []
-    _ = cv2.ORB_create()  # warmup default
 
     total_iters = len(combos) * repeats
     pbar = tqdm(total=total_iters, desc=f"ORB {image_name}") if _HAS_TQDM else None
 
-    for vals in combos:
+    print(f"Testando {len(combos)} combinazioni di parametri ORB...")
+
+    for combo_idx, vals in enumerate(combos):
         params = dict(zip(keys, vals))
+
+        # Debug: stampa ogni 50 combinazioni per verificare che i parametri cambino
+        if combo_idx % 50 == 0:
+            print(
+                f"Combo {combo_idx}: nfeatures={params['nfeatures']}, scaleFactor={params['scaleFactor']}, edgeThreshold={params['edgeThreshold']}"
+            )
+
         try:
-            orb = cv2.ORB_create(**params)
+            # Crea SEMPRE un nuovo oggetto ORB per ogni combinazione di parametri
+            orb = cv2.ORB_create(
+                nfeatures=params["nfeatures"],
+                scaleFactor=params["scaleFactor"],
+                nlevels=params["nlevels"],
+                edgeThreshold=params["edgeThreshold"],
+                firstLevel=params["firstLevel"],
+                WTA_K=params["WTA_K"],
+                scoreType=params["scoreType"],
+                patchSize=params["patchSize"],
+                fastThreshold=params["fastThreshold"],
+            )
+        except Exception as e:
+            print(f"Errore creazione ORB con params {params}: {e}")
+            continue
+
+        # Warmup con il nuovo oggetto ORB
+        try:
+            _ = orb.detectAndCompute(gray, None)
         except Exception:
             continue
 
-        _ = orb.detect(gray, None)  # warmup
-
         for r in range(repeats):
-            t0 = time.perf_counter()
-            kp, des = orb.detectAndCompute(gray, None)
-            dt_ms = (time.perf_counter() - t0) * 1000.0
+            try:
+                t0 = time.perf_counter()
+                kp, des = orb.detectAndCompute(gray, None)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
 
-            n_kp = 0 if kp is None else len(kp)
-            dshape0, dshape1 = des.shape if des is not None else (0, 0)
+                n_kp = 0 if kp is None else len(kp)
+                dshape0, dshape1 = des.shape if des is not None else (0, 0)
 
-            rows.append(
-                {
-                    "test_type": "orb",
-                    "framework": "OpenCV",
-                    "variant": "ORB",
-                    "device": "cpu",  # ORB è CPU, lascia così anche su GPU
-                    "image": image_name,
-                    "run": r + 1,
-                    "latency_ms": round(dt_ms, 3),
-                    "img_size": np.nan,
-                    "conf": np.nan,
-                    "iou": np.nan,
-                    "retina_masks": np.nan,
-                    "n_keypoints": n_kp,
-                    "desc_shape_0": dshape0,
-                    "desc_shape_1": dshape1,
-                    "kp_per_ms": (n_kp / max(dt_ms, 1e-6)),
-                    **params,
-                }
-            )
+                rows.append(
+                    {
+                        "test_type": "orb",
+                        "framework": "OpenCV",
+                        "variant": "ORB",
+                        "device": "cpu",
+                        "image": image_name,
+                        "run": r + 1,
+                        "latency_ms": round(dt_ms, 3),
+                        # ORB specifici
+                        "n_keypoints": n_kp,
+                        "desc_shape_0": dshape0,
+                        "desc_shape_1": dshape1,
+                        "kp_per_ms": round(n_kp / max(dt_ms, 1e-6), 2),
+                        # Parametri ORB
+                        "nfeatures": params["nfeatures"],
+                        "scaleFactor": params["scaleFactor"],
+                        "nlevels": params["nlevels"],
+                        "edgeThreshold": params["edgeThreshold"],
+                        "firstLevel": params["firstLevel"],
+                        "WTA_K": params["WTA_K"],
+                        "scoreType": params["scoreType"],
+                        "patchSize": params["patchSize"],
+                        "fastThreshold": params["fastThreshold"],
+                    }
+                )
+
+            except Exception as e:
+                print(f"Errore durante detection: {e}")
+                continue
 
             if pbar:
                 pbar.update(1)
 
     if pbar:
         pbar.close()
+
+    print(f"Completate {len(rows)} misurazioni ORB")
     return pd.DataFrame(rows)
 
 
@@ -262,57 +290,77 @@ def main():
     sizes = [512, 576, 640, 704, 768, 832, 896, 960, 1024]
     repeats = 5
 
-    dfs = []
+    # ========== FASTSAM ==========
+    dfs_fastsam = []
 
-    # FastSAM-x
-
-    print(f"-- Benchmark FastSAM-x.pt")
+    print("-- Benchmark FastSAM-x.pt")
     try:
-        dfs.append(
+        dfs_fastsam.append(
             run_fastsam_bench("FastSAM-x.pt", device, sizes, images, repeats=repeats)
         )
     except Exception as e:
         print(f"[ERRORE] FastSAM-x: {e}", file=sys.stderr)
 
-    # FastSAM-s
-
-    print(f"-- Benchmark FastSAM-s.pt")
+    print("-- Benchmark FastSAM-s.pt")
     try:
-        dfs.append(
+        dfs_fastsam.append(
             run_fastsam_bench("FastSAM-s.pt", device, sizes, images, repeats=repeats)
         )
     except Exception as e:
         print(f"[ERRORE] FastSAM-s: {e}", file=sys.stderr)
 
-    print("-- ORB sweep solo sulla prima")
+    if dfs_fastsam:
+        df_fastsam = pd.concat(dfs_fastsam, ignore_index=True)
+        df_fastsam = df_fastsam.sort_values(
+            ["variant", "image", "img_size", "run"], kind="mergesort"
+        )
+        save_csv(df_fastsam, "fastsam_benchmark.csv")
+    else:
+        print("[WARN] Nessun risultato FastSAM generato.")
+
+    # ========== ORB ==========
+    dfs_orb = []
+    print("-- ORB sweep")
     try:
-        for name, im in images_detection[:1]:
-            dfs.append(run_orb_sweep(im, name, repeats=3))
+        for name, im in images_detection:
+            print(f"Processando immagine: {name}")
+            dfs_orb.append(
+                run_orb_sweep(im, name, repeats=3, max_side=1024, max_combos=200)
+            )
     except Exception as e:
         print(f"[ERRORE] ORB: {e}", file=sys.stderr)
 
-    if not dfs:
-        print(
-            "Nessun risultato generato. Controlla modelli/immagini e dipendenze.",
-            file=sys.stderr,
+    if dfs_orb:
+        df_orb = pd.concat(dfs_orb, ignore_index=True)
+        df_orb = df_orb.sort_values(
+            ["image", "latency_ms", "n_keypoints"],
+            ascending=[True, True, False],
+            kind="mergesort",
         )
-        sys.exit(2)
+        save_csv(df_orb, "orb_benchmark.csv")
 
-    final_df = pd.concat(dfs, ignore_index=True)
+        # Analisi veloce per verificare la varianza
+        print(f"\nStatistiche ORB:")
+        print(
+            f"Range latenza: {df_orb['latency_ms'].min():.2f} - {df_orb['latency_ms'].max():.2f} ms"
+        )
+        print(
+            f"Range keypoints: {df_orb['n_keypoints'].min()} - {df_orb['n_keypoints'].max()}"
+        )
+        print(f"Varianza latenza: {df_orb['latency_ms'].var():.2f}")
+        print(f"Varianza keypoints: {df_orb['n_keypoints'].var():.2f}")
+    else:
+        print("[WARN] Nessun risultato ORB generato.")
 
-    # ordina per tipo e poi per latenza
-    final_df = final_df.sort_values(
-        ["test_type", "image", "variant", "img_size", "run"],
-        na_position="last",
-        kind="mergesort",
-    )
-
-    out_path = "benchmark_results.csv"
-    save_csv(final_df, out_path)
-
-    with pd.option_context("display.max_rows", 20, "display.max_columns", None):
-        print("\nAnteprima risultati:")
-        print(final_df.head(20).to_string(index=False))
+    # Stampa breve anteprima
+    if dfs_fastsam:
+        print("\nAnteprima FASTSAM:")
+        with pd.option_context("display.max_rows", 10, "display.max_columns", None):
+            print(df_fastsam.head(10).to_string(index=False))
+    if dfs_orb:
+        print("\nAnteprima ORB:")
+        with pd.option_context("display.max_rows", 10, "display.max_columns", None):
+            print(df_orb.head(10).to_string(index=False))
 
 
 if __name__ == "__main__":
